@@ -1,18 +1,15 @@
-// main.go
 package main
 
 import (
-	"encoding/json"
-	"log"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
-	"github.com/rs/cors"
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/shogo82148/go-mecab"
 )
 
 type Memory struct {
@@ -20,148 +17,131 @@ type Memory struct {
 	Timestamp         time.Time `json:"timestamp"`
 	InitialImportance float64   `json:"initialImportance"`
 	UseCount          int       `json:"useCount"`
+	Keywords          []string  `json:"keywords"`
 }
 
-type Message struct {
-	ID        string    `json:"id"`
-	Type      string    `json:"type"`
-	Content   string    `json:"content"`
-	Timestamp time.Time `json:"timestamp"`
+type MemoryStore struct {
+	Memories map[string]Memory
 }
 
-type ChatResponse struct {
-	Message      Message           `json:"message"`
-	Memories     map[string]Memory `json:"memories"`
-	ForgottenKey string            `json:"forgottenKey,omitempty"`
-}
-
-type Server struct {
-	memories map[string]Memory
-	mutex    sync.RWMutex
-}
-
-func NewServer() *Server {
-	server := &Server{
-		memories: make(map[string]Memory),
-	}
-
-	// Start forgetting process
-	go server.startForgettingProcess()
-
-	return server
-}
-
-func (s *Server) startForgettingProcess() {
-	ticker := time.NewTicker(10 * time.Second)
-	for range ticker.C {
-		s.forgetMemories()
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{
+		Memories: make(map[string]Memory),
 	}
 }
 
-func (s *Server) forgetMemories() {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	for key, memory := range s.memories {
-		importance := s.calculateImportance(memory)
-		if rand.Float64() > importance/100 {
-			delete(s.memories, key)
-		}
+// 形態素解析を行い、重要な単語を抽出する
+func extractKeywords(text string) ([]string, error) {
+	tagger, err := mecab.New(map[string]string{
+		"output-format-type": "wakati",
+	})
+	if err != nil {
+		return nil, err
 	}
-}
+	defer tagger.Destroy()
 
-func (s *Server) calculateImportance(memory Memory) float64 {
-	age := time.Since(memory.Timestamp).Hours()
-	ageWeight := math.Exp(-age / 24) // Decay over 24 hours
-	return memory.InitialImportance * ageWeight * math.Log(float64(memory.UseCount+1))
-}
-
-func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		Content string `json:"content"`
+	node, err := tagger.ParseToNode(text)
+	if err != nil {
+		return nil, err
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Process message and update memories
-	response := s.processMessage(input.Content)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-func (s *Server) processMessage(content string) ChatResponse {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	// Create new message
-	message := Message{
-		ID:        time.Now().Format(time.RFC3339Nano),
-		Type:      "ai",
-		Content:   "",
-		Timestamp: time.Now(),
-	}
-
-	// Process input and update memories
-	words := splitIntoWords(content)
-	var rememberedContent string
-
-	for _, word := range words {
-		if len(word) > 3 {
-			if memory, exists := s.memories[word]; exists {
-				rememberedContent = memory.Content
-				memory.UseCount++
-				s.memories[word] = memory
-			} else {
-				s.memories[word] = Memory{
-					Content:           content,
-					Timestamp:         time.Now(),
-					InitialImportance: 50 + rand.Float64()*50,
-					UseCount:          1,
+	var keywords []string
+	for ; node != (mecab.Node{}); node = node.Next() {
+		features := strings.Split(node.Feature(), ",")
+		if len(features) > 0 {
+			pos := features[0] // 品詞情報
+			if pos == "名詞" || pos == "動詞" || pos == "形容詞" {
+				if len(node.Surface()) > 1 { // 1文字以上の単語のみ
+					keywords = append(keywords, node.Surface())
 				}
 			}
 		}
 	}
-
-	// Generate response
-	if rememberedContent != "" {
-		message.Content = "以前の会話を思い出しました: " + rememberedContent
-	} else {
-		message.Content = "申し訳ありません。関連する記憶が曖昧です..."
-	}
-
-	return ChatResponse{
-		Message:  message,
-		Memories: s.memories,
-	}
+	return keywords, nil
 }
 
-func splitIntoWords(text string) []string {
-	// Implement word splitting logic here
-	// This is a simple implementation - you might want to use a proper tokenizer
-	return strings.Fields(text)
+// 重要度の計算
+func calculateImportance(memory Memory) float64 {
+	age := time.Since(memory.Timestamp).Hours()
+	ageWeight := math.Exp(-age / 24) // 24時間で重要度が半減
+	useCount := float64(memory.UseCount)
+	return memory.InitialImportance * ageWeight * math.Log(useCount+1)
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	store := NewMemoryStore()
+	router := gin.Default()
 
-	server := NewServer()
-	router := mux.NewRouter()
+	// CORSの設定
+	router.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"*"},
+		AllowMethods:     []string{"POST", "GET", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+	}))
 
-	router.HandleFunc("/api/chat", server.handleMessage).Methods("POST")
+	// メモリの保存
+	router.POST("/memory", func(c *gin.Context) {
+		var input struct {
+			Content string `json:"content"`
+		}
+		if err := c.BindJSON(&input); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 
-	// Setup CORS
-	c := cors.New(cors.Options{
-		AllowedOrigins: []string{"http://localhost:3000"},
-		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders: []string{"Accept", "Content-Type", "Content-Length", "Accept-Encoding", "X-CSRF-Token", "Authorization"},
+		keywords, err := extractKeywords(input.Content)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		memory := Memory{
+			Content:           input.Content,
+			Timestamp:         time.Now(),
+			InitialImportance: 50 + rand.Float64()*50, // 50-100の重要度
+			UseCount:          1,
+			Keywords:          keywords,
+		}
+
+		for _, keyword := range keywords {
+			if existing, exists := store.Memories[keyword]; exists {
+				existing.UseCount++
+				store.Memories[keyword] = existing
+			} else {
+				store.Memories[keyword] = memory
+			}
+		}
+
+		c.JSON(http.StatusOK, memory)
 	})
 
-	handler := c.Handler(router)
+	// 関連メモリの取得
+	router.GET("/memory", func(c *gin.Context) {
+		query := c.Query("q")
+		if query == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "query parameter is required"})
+			return
+		}
 
-	log.Println("Server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", handler))
+		keywords, err := extractKeywords(query)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		var relevantMemories []Memory
+		for _, keyword := range keywords {
+			if memory, exists := store.Memories[keyword]; exists {
+				if calculateImportance(memory) > rand.Float64()*100 { // ランダムな忘却
+					relevantMemories = append(relevantMemories, memory)
+				}
+			}
+		}
+
+		c.JSON(http.StatusOK, relevantMemories)
+	})
+
+	router.Run(":8080")
 }

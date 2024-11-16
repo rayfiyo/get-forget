@@ -1,0 +1,24 @@
+# the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion
+# version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - CGO_LDFLAGS=$(mecab-config --libs)
+      - CGO_CFLAGS=$(mecab-config --cflags)
+    volumes:
+      - ./go:/app/go
+      - ./node:/app/node
+    ports:
+      - "8080:8080" # Go アプリケーションのポート
+      - "3000:3000" # Node.js アプリケーションのポート
+    networks:
+      - app-network
+    tty: true
+
+networks:
+  app-network:
+    driver: bridge
